@@ -1,0 +1,269 @@
+/**
+ * Edge 翻译精简版 - 网页即时翻译
+ * 功能：选择目标语种 → 获取 Edge 授权 → 批量翻译页面文本 → 替换显示
+ * 无多余功能：无术语库、无节点监听、无多节点测速、无缓存策略
+ */
+(function () {
+    // ---------- 语言列表（Edge serviceId => 显示名称）----------
+    const LANGUAGES = [
+        { id: "en", name: "English" },
+        { id: "zh-CHT", name: "繁體中文" },
+        { id: "zh-CHS", name: "简体中文" },
+        { id: "ja", name: "日本語" },
+        { id: "fr", name: "Français" },
+        { id: "de", name: "Deutsch" },
+        { id: "ru", name: "Русский" },
+        { id: "es", name: "Español" },
+        { id: "it", name: "Italiano" },
+        { id: "pt", name: "Português" },
+        { id: "ko", name: "한국어" },
+        { id: "ar", name: "العربية" },
+        { id: "th", name: "ไทย" },
+        { id: "vi", name: "Tiếng Việt" }
+    ];
+
+    // ---------- 忽略标签（不翻译这些元素内的文本）----------
+    const IGNORE_TAGS = new Set(['SCRIPT', 'STYLE', 'NOSCRIPT', 'IFRAME', 'CODE', 'PRE']);
+
+    // ---------- 全局变量 ----------
+    let textNodes = [];           // 存储 { node, originalText }
+    let isTranslating = false;    // 防止并发翻译
+    let currentToLang = '';       // 当前选择的目标语言
+    let cachedToken = null;          // 存储已获取的 token
+    let tokenPromise = null;         // 防止并发请求 token
+
+    // ---------- 辅助函数 ----------
+    // 获取 Edge token（带缓存）
+    async function getEdgeToken(forceRefresh = false) {
+        if (!forceRefresh && cachedToken) return cachedToken;
+        // 避免同时多次请求
+        if (tokenPromise) return tokenPromise;
+        tokenPromise = (async () => {
+            try {
+                const res = await fetch('https://edge.microsoft.com/translate/auth', {
+                    method: 'GET',
+                    credentials: 'omit'
+                });
+                if (!res.ok) throw new Error(`Auth failed: ${res.status}`);
+                const token = await res.text();
+                cachedToken = token;
+                return token;
+            } catch (err) {
+                throw err;
+            } finally {
+                tokenPromise = null;
+            }
+        })();
+        return tokenPromise;
+    }
+
+    // 批量翻译（自动分批：每批最多20条，总字符数不超过5000）
+    async function translateBatch(texts, fromLang, toLang, retryOnAuth = true) {
+        if (!texts.length) return [];
+        let token = await getEdgeToken();
+        const url = `https://api.cognitive.microsofttranslator.com/translate?api-version=3.0&includeSentenceLength=true&to=${toLang}`;
+        const finalUrl = fromLang === 'auto' ? url : `${url}&from=${fromLang}`;
+
+        const makeRequest = async (tk) => {
+            return fetch(finalUrl, {
+                method: 'POST',
+                headers: {
+                    'Authorization': `Bearer ${tk}`,
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify(texts.map(t => ({ Text: t })))
+            });
+        };
+
+        let response = await makeRequest(token);
+        if (response.status === 401 && retryOnAuth) {
+            // token 可能过期，重新获取并重试一次
+            token = await getEdgeToken(true);
+            response = await makeRequest(token);
+        }
+        if (!response.ok) throw new Error(`Translate API error: ${response.status}`);
+        const data = await response.json();
+        return data.map(item => item.translations[0].text);
+    }
+
+    // 将文本数组按大小拆分（每批最多20条，总字符≤5000）
+    function splitTextsForBatch(texts, maxItems = 20, maxChars = 5000) {
+        const batches = [];
+        let currentBatch = [];
+        let currentChars = 0;
+
+        for (let text of texts) {
+            const len = text.length;
+            if (currentBatch.length >= maxItems || (currentChars + len > maxChars && currentBatch.length > 0)) {
+                batches.push([...currentBatch]);
+                currentBatch = [];
+                currentChars = 0;
+            }
+            currentBatch.push(text);
+            currentChars += len;
+        }
+        if (currentBatch.length) batches.push(currentBatch);
+        return batches;
+    }
+
+    // 执行完整翻译（基于原始文本）
+    async function performTranslation(toLang, fromLang = 'auto') {
+        if (isTranslating) return;
+        if (!textNodes.length) {
+            return;
+        }
+
+        isTranslating = true;
+        const startTime = Date.now();
+
+        // 收集所有原始文本（仅翻译非空、非空白）
+        const originalTexts = textNodes.map(item => item.originalText).filter(txt => txt && txt.trim().length > 0);
+        if (originalTexts.length === 0) {
+            isTranslating = false;
+            return;
+        }
+
+        // 分批
+        const batches = splitTextsForBatch(originalTexts);
+        // 翻译结果映射（索引 -> 翻译后文本）
+        const translatedMap = new Array(originalTexts.length).fill(null);
+
+        // 逐批请求（串行避免并发过高）
+        let currentStart = 0;
+        for (const batch of batches) {
+            try {
+                const batchResults = await translateBatch(batch, fromLang, toLang);
+                for (let i = 0; i < batchResults.length; i++) {
+                    translatedMap[currentStart + i] = batchResults[i];
+                }
+                currentStart += batch.length;
+            } catch (err) {
+                // 失败批次保留原文（避免空白）
+                for (let i = 0; i < batch.length; i++) {
+                    translatedMap[currentStart + i] = batch[i];
+                }
+                currentStart += batch.length;
+            }
+        }
+
+        // 更新页面文本节点
+        let resultIdx = 0;
+        for (let i = 0; i < textNodes.length; i++) {
+            const item = textNodes[i];
+            const orig = item.originalText;
+            if (orig && orig.trim().length > 0) {
+                const translated = translatedMap[resultIdx++];
+                if (translated !== undefined && translated !== null) {
+                    item.node.nodeValue = translated;
+                }
+            }
+        }
+
+        isTranslating = false;
+        currentToLang = toLang;
+    }
+
+    // ---------- 提取页面所有文本节点（过滤忽略标签）----------
+    function extractTextNodes(root = document.body) {
+        const nodes = [];
+        const walker = document.createTreeWalker(
+            root,
+            NodeFilter.SHOW_TEXT,
+            {
+                acceptNode: function (node) {
+                    // 过滤空文本/空白符
+                    if (!node.nodeValue || node.nodeValue.trim().length === 0)
+                        return NodeFilter.FILTER_SKIP;
+                    // 检查父元素是否在忽略标签内
+                    let parent = node.parentElement;
+                    while (parent && parent !== document.body) {
+                        if (IGNORE_TAGS.has(parent.tagName))
+                            return NodeFilter.FILTER_SKIP;
+                        // 支持 class="notranslate" 忽略
+                        if (parent.classList && parent.classList.contains('notranslate'))
+                            return NodeFilter.FILTER_SKIP;
+                        parent = parent.parentElement;
+                    }
+                    return NodeFilter.FILTER_ACCEPT;
+                }
+            }
+        );
+        while (walker.nextNode()) {
+            const node = walker.currentNode;
+            nodes.push({
+                node: node,
+                originalText: node.nodeValue   // 保存原始文本
+            });
+        }
+        return nodes;
+    }
+
+    // ---------- 构建语言选择下拉框 ----------
+    function buildLanguageSelector(containerId = 'translate-selector') {
+        let container = document.getElementById(containerId);
+        if (!container) {
+            container = document.createElement('div');
+            container.id = containerId;
+            container.style.cssText = 'position:fixed; bottom:20px; right:20px; z-index:9999; background:#fff; border:1px solid #ccc; border-radius:8px; padding:8px 12px; box-shadow:0 2px 8px rgba(0,0,0,0.2); font-family:sans-serif;';
+            document.body.appendChild(container);
+        }
+        const select = document.createElement('select');
+        select.style.cssText = 'padding:6px 12px; font-size:14px; border-radius:4px; border:1px solid #aaa; cursor:pointer;';
+        // 添加默认选项
+        const defaultOption = document.createElement('option');
+        defaultOption.value = '';
+        defaultOption.disabled = true;
+        defaultOption.selected = true;
+        defaultOption.textContent = '🌐 Translate as...';
+        select.appendChild(defaultOption);
+
+        for (const lang of LANGUAGES) {
+            const option = document.createElement('option');
+            option.value = lang.id;
+            option.textContent = lang.name;
+            select.appendChild(option);
+        }
+
+        select.addEventListener('change', async (e) => {
+            const toLang = e.target.value;
+            if (!toLang) return;
+            if (currentToLang === toLang) {
+                return;
+            }
+            // 翻译前备份原始文本（仅首次加载时备份，或者如果 textNodes 为空才备份）
+            if (textNodes.length === 0) {
+                textNodes = extractTextNodes();
+            } else {
+                // 若已经存在文本节点但当前显示的不是原始语言（用户切换过），则需要还原原始文本再翻译？
+                // 因为 textNodes 中保存的 originalText 是页面初始加载时的内容，但若用户多次切换，node.nodeValue 已被改变，
+                // 而我们的翻译始终基于 originalText，所以无需还原。但为了界面一致性，可以在切换前将页面暂时恢复原文？
+                // 实际上直接用 originalText 重新请求翻译再覆盖是正确的，不需额外操作。
+            }
+            await performTranslation(toLang, 'auto');
+        });
+
+        container.innerHTML = ''; // 清空可能残留
+        container.appendChild(select);
+    }
+    // 在页面加载时提前获取 token（可选，不阻塞翻译）
+    function preloadToken() {
+        getEdgeToken().catch(err => console.warn('Get token failed，next get.', err));
+    }
+    // ---------- 初始化入口 ----------
+    function init() {
+        if (document.readyState === 'loading') {
+            preloadToken();   // 提前获取一次
+            document.addEventListener('DOMContentLoaded', () => {
+                buildLanguageSelector();
+                // 预先提取文本节点，但不翻译（等用户选择）
+                textNodes = extractTextNodes();
+            });
+        } else {
+            buildLanguageSelector();
+            textNodes = extractTextNodes();
+        }
+    }
+
+    // 启动
+    init();
+})();
